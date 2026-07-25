@@ -1,0 +1,30 @@
+{
+  "bot.py": {
+    "bytes": 50168,
+    "sha256": "d31ab25043bc88ee7fff4fbe92ba6b5a3edcb25c12181c9ad503aca1c6745b36"
+  },
+  "database.py": {
+    "bytes": 10230,
+    "sha256": "33e36a99da9e45c48fd2ce6173efdad7441492054c17c845d7fbb070c1ac00c9"
+  },
+  "game.py": {
+    "bytes": 3051,
+    "sha256": "3e42e29771a5b423feffee3fa5a6997d0f183e8efe3884cac20e14369bf6777a"
+  },
+  "keyboards.py": {
+    "bytes": 9370,
+    "sha256": "d529c86eff4aae3a14f01ebbb0a52b937eb33aa19096dcb80f96adafca61c3e8"
+  },
+  "texts.py": {
+    "bytes": 13293,
+    "sha256": "3187f263db90e335f50a3ad3931dc6ee4b9ebfefdc4be6d98d7767194f14cf1a"
+  },
+  "words.py": {
+    "bytes": 8892,
+    "sha256": "9bf0db2da4d86820c5cdc17688ebcbe45c9914d3a45acce475b80f4f4ffb1c3c"
+  },
+  "README_PREMIUM.md": {
+    "bytes": 9360,
+    "sha256": "b6d5194a3478f35fb77fb644635138f03283605fcb318ad933939f0edca2f41a"
+  }
+}

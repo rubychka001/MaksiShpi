@@ -20,6 +20,7 @@ def default_session() -> dict[str, Any]:
         "player_count": 4,
         "spy_count": 1,
         "category": "all",
+        "pending_category": None,
         "players": [],
         "draft_names": [],
         "name_index": 0,
@@ -39,6 +40,10 @@ def merge_session(raw: dict[str, Any] | None) -> dict[str, Any]:
     session = default_session()
     if raw:
         session.update(raw)
+    if session.get("category") not in CATEGORIES:
+        session["category"] = "all"
+    if session.get("pending_category") not in CATEGORIES:
+        session["pending_category"] = None
     return session
 
 
