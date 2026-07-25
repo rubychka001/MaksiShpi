@@ -1,30 +1,37 @@
 {
   "bot.py": {
-    "bytes": 50168,
-    "sha256": "d31ab25043bc88ee7fff4fbe92ba6b5a3edcb25c12181c9ad503aca1c6745b36"
+    "sha256": "c3edb12649bc2d39a42ce7db2a2d7b42d2cfc5331d65ad382a6a74d3a92792ef",
+    "lines": 1870,
+    "bytes": 73448
   },
   "database.py": {
-    "bytes": 10230,
-    "sha256": "33e36a99da9e45c48fd2ce6173efdad7441492054c17c845d7fbb070c1ac00c9"
-  },
-  "game.py": {
-    "bytes": 3051,
-    "sha256": "3e42e29771a5b423feffee3fa5a6997d0f183e8efe3884cac20e14369bf6777a"
+    "sha256": "1a5be90200f8b6cbc4ea1c977e95c3f8b7ed9cab85bbc19e4d5f42cd55f344cc",
+    "lines": 628,
+    "bytes": 23402
   },
   "keyboards.py": {
-    "bytes": 9370,
-    "sha256": "d529c86eff4aae3a14f01ebbb0a52b937eb33aa19096dcb80f96adafca61c3e8"
+    "sha256": "f6f4a9af4924ebe6164c358328bd77d0b3cec9094c34197fa7e7fe554fe9ffe7",
+    "lines": 324,
+    "bytes": 13102
   },
   "texts.py": {
-    "bytes": 13293,
-    "sha256": "3187f263db90e335f50a3ad3931dc6ee4b9ebfefdc4be6d98d7767194f14cf1a"
+    "sha256": "3233fb44f13c57aa0fdbdc121a29de0535a50707ac92c8c68407d79773eee62f",
+    "lines": 396,
+    "bytes": 19307
+  },
+  "config.py": {
+    "sha256": "5820d19033c0e934c2ff0ffc091b68a7e4e7f08ca889e4af538535cbe8ebf7ed",
+    "lines": 63,
+    "bytes": 2102
+  },
+  "game.py": {
+    "sha256": "3e42e29771a5b423feffee3fa5a6997d0f183e8efe3884cac20e14369bf6777a",
+    "lines": 96,
+    "bytes": 3051
   },
   "words.py": {
-    "bytes": 8892,
-    "sha256": "9bf0db2da4d86820c5cdc17688ebcbe45c9914d3a45acce475b80f4f4ffb1c3c"
-  },
-  "README_PREMIUM.md": {
-    "bytes": 9360,
-    "sha256": "b6d5194a3478f35fb77fb644635138f03283605fcb318ad933939f0edca2f41a"
+    "sha256": "9bf0db2da4d86820c5cdc17688ebcbe45c9914d3a45acce475b80f4f4ffb1c3c",
+    "lines": 357,
+    "bytes": 8892
   }
 }

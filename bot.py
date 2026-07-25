@@ -11,19 +11,21 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import random
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeChat,
     CallbackQuery,
     LabeledPrice,
     Message,
     PreCheckoutQuery,
+    TelegramObject,
 )
 
 from config import Config, load_config
@@ -62,7 +64,35 @@ DB: Database
 CONFIG: Config
 CHAT_LOCKS: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 WAITING_FOR_STICKER_ID: set[int] = set()
+ADMIN_FLOW: dict[int, dict[str, Any]] = {}
 logger = logging.getLogger("MaksiShpi")
+
+
+class UserTrackingMiddleware(BaseMiddleware):
+    """Сохраняет пользователей для статистики и будущих рассылок."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user is not None:
+            with suppress(Exception):
+                await DB.upsert_user(
+                    user_id=user.id,
+                    username=user.username or "",
+                    first_name=user.first_name or "",
+                    last_name=user.last_name or "",
+                    language_code=user.language_code or "",
+                    is_bot=bool(user.is_bot),
+                )
+        return await handler(event, data)
+
+
+router.message.middleware(UserTrackingMiddleware())
+router.callback_query.middleware(UserTrackingMiddleware())
 
 
 async def get_session(chat_id: int) -> dict[str, Any]:
@@ -83,6 +113,142 @@ async def deny_non_admin(message: Message) -> bool:
         return False
     await message.answer("⛔ Эта команда доступна только владельцу бота.")
     return True
+
+
+async def require_admin_callback(callback: CallbackQuery) -> bool:
+    if is_admin(callback.from_user.id):
+        return True
+    await answer_callback(callback, "Нет доступа к админ-панели", show_alert=True)
+    return False
+
+
+def parse_positive_user_id(value: str) -> int | None:
+    try:
+        user_id = int(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return user_id if user_id > 0 else None
+
+
+async def show_admin_panel(message: Message, *, edit: bool = True) -> None:
+    admin_id = message.chat.id
+    ADMIN_FLOW.pop(admin_id, None)
+    text = texts.admin_panel_text(admin_id)
+    markup = kb.admin_main_keyboard()
+    if edit:
+        await safe_edit(message, text, markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+
+
+async def show_admin_user(message: Message, user_id: int, *, edit: bool = False) -> bool:
+    user = await DB.get_user(user_id)
+    if user is None:
+        text = (
+            "<b>⚠️ Пользователь не найден</b>\n\n"
+            f"ID: <code>{user_id}</code>\n\n"
+            "Попросите пользователя сначала открыть бота и отправить /start."
+        )
+        if edit:
+            await safe_edit(message, text, kb.admin_back_keyboard())
+        else:
+            await message.answer(text, reply_markup=kb.admin_back_keyboard())
+        return False
+    premium_active = int(user.get("expires_at", 0)) > int(time.time())
+    text = texts.admin_user_text(user, premium_active)
+    markup = kb.admin_user_keyboard(user_id, premium_active)
+    if edit:
+        await safe_edit(message, text, markup)
+    else:
+        await message.answer(text, reply_markup=markup)
+    return True
+
+
+async def handle_admin_input(message: Message, bot: Bot) -> bool:
+    """Обрабатывает сообщения, которые администратор вводит внутри панели."""
+    if message.from_user is None or not is_admin(message.from_user.id):
+        return False
+    admin_id = message.from_user.id
+    flow = ADMIN_FLOW.get(admin_id)
+    if not flow:
+        return False
+
+    state = str(flow.get("state", ""))
+
+    if state == "broadcast_waiting":
+        if message.text and message.text.startswith("/"):
+            return False
+        recipients = len(await DB.get_broadcast_user_ids())
+        ADMIN_FLOW[admin_id] = {
+            "state": "broadcast_preview",
+            "source_chat_id": message.chat.id,
+            "source_message_id": message.message_id,
+        }
+        await message.answer(
+            texts.admin_broadcast_preview_text(recipients),
+            reply_markup=kb.admin_broadcast_preview_keyboard(),
+        )
+        return True
+
+    if not message.text or message.text.startswith("/"):
+        await message.answer(
+            "Отправьте Telegram ID цифрами одним текстовым сообщением.",
+            reply_markup=kb.admin_cancel_input_keyboard(),
+        )
+        return True
+
+    user_id = parse_positive_user_id(message.text)
+    if user_id is None:
+        await message.answer(
+            "<b>⚠️ Неверный Telegram ID</b>\n\n"
+            "ID должен состоять только из цифр и быть положительным.",
+            reply_markup=kb.admin_cancel_input_keyboard(),
+        )
+        return True
+
+    user = await DB.get_user(user_id)
+    if user is None:
+        await message.answer(
+            "<b>⚠️ Пользователь не найден</b>\n\n"
+            "Попросите его сначала открыть бота и отправить /start.",
+            reply_markup=kb.admin_cancel_input_keyboard(),
+        )
+        return True
+
+    if state == "grant_waiting_user":
+        ADMIN_FLOW[admin_id] = {"state": "grant_period", "user_id": user_id}
+        await message.answer(
+            texts.admin_user_text(
+                user, int(user.get("expires_at", 0)) > int(time.time())
+            )
+            + "\n\n<b>Выберите срок, который нужно добавить:</b>",
+            reply_markup=kb.admin_grant_period_keyboard(user_id),
+        )
+        return True
+
+    if state == "revoke_waiting_user":
+        expires_at = int(user.get("expires_at", 0))
+        if expires_at <= int(time.time()):
+            ADMIN_FLOW.pop(admin_id, None)
+            await message.answer(
+                "<b>ℹ️ PREMIUM уже не активен</b>\n\n"
+                f"Пользователь: <code>{user_id}</code>",
+                reply_markup=kb.admin_back_keyboard(),
+            )
+            return True
+        ADMIN_FLOW[admin_id] = {"state": "revoke_confirm", "user_id": user_id}
+        await message.answer(
+            texts.admin_revoke_confirm_text(user_id, expires_at),
+            reply_markup=kb.admin_revoke_confirm_keyboard(user_id),
+        )
+        return True
+
+    if state == "find_waiting_user":
+        ADMIN_FLOW.pop(admin_id, None)
+        await show_admin_user(message, user_id)
+        return True
+
+    return False
 
 
 async def answer_callback(
@@ -128,6 +294,7 @@ async def send_optional_sticker(bot: Bot, chat_id: int, sticker_id: str | None) 
 
 
 async def show_home(message: Message, session: dict[str, Any], *, edit: bool = False) -> None:
+    ADMIN_FLOW.pop(message.chat.id, None)
     session["state"] = "home"
     session["role_visible"] = False
     session["word"] = ""
@@ -138,7 +305,12 @@ async def show_home(message: Message, session: dict[str, Any], *, edit: bool = F
     await save_session(message.chat.id, session)
 
     premium = await DB.get_premium_status(message.chat.id)
-    markup = kb.welcome_keyboard(bool(session.get("players")), premium["active"])
+    admin_user = message.chat.id
+    markup = kb.welcome_keyboard(
+        bool(session.get("players")),
+        premium["active"],
+        is_admin(admin_user),
+    )
     text = texts.welcome_text(premium["active"], premium["expires_at"])
     if edit:
         await safe_edit(message, text, markup)
@@ -341,6 +513,13 @@ async def command_my_id(message: Message) -> None:
     )
 
 
+@router.message(Command("admin"))
+async def command_admin(message: Message) -> None:
+    if await deny_non_admin(message):
+        return
+    await show_admin_panel(message, edit=False)
+
+
 @router.message(Command("grantpremium"))
 async def command_grant_premium(message: Message, bot: Bot) -> None:
     if await deny_non_admin(message):
@@ -364,8 +543,8 @@ async def command_grant_premium(message: Message, bot: Bot) -> None:
         )
         return
 
-    if target_user_id <= 0 or not 1 <= days <= 3650:
-        await message.answer("USER_ID должен быть положительным, а срок — от 1 до 3650 дней.")
+    if target_user_id <= 0 or not 1 <= days <= 36500:
+        await message.answer("USER_ID должен быть положительным, а срок — от 1 до 36500 дней.")
         return
 
     result = await DB.grant_premium(
@@ -453,6 +632,8 @@ async def command_terms(message: Message) -> None:
 
 @router.message(Command("cancel"))
 async def command_cancel(message: Message, bot: Bot) -> None:
+    if message.from_user is not None:
+        ADMIN_FLOW.pop(message.from_user.id, None)
     async with CHAT_LOCKS[message.chat.id]:
         session = await get_session(message.chat.id)
         await cleanup_active_message(bot, message.chat.id, session)
@@ -472,14 +653,28 @@ async def command_sticker_id(message: Message) -> None:
 
 
 @router.message(F.sticker)
-async def receive_sticker_id(message: Message) -> None:
+async def receive_sticker_id(message: Message, bot: Bot) -> None:
+    if await handle_admin_input(message, bot):
+        return
     if message.chat.id not in WAITING_FOR_STICKER_ID:
+        await message.answer(
+            "Используйте кнопки под сообщением. Для возврата в начало отправьте /start."
+        )
         return
     WAITING_FOR_STICKER_ID.discard(message.chat.id)
     await message.answer(
         "Скопируйте значение ниже в <code>WELCOME_STICKER_ID</code> "
         "или <code>RESULT_STICKER_ID</code>:\n\n"
         f"<code>{message.sticker.file_id}</code>"
+    )
+
+
+@router.message(F.photo | F.video | F.document | F.animation | F.audio | F.voice | F.video_note)
+async def receive_admin_media(message: Message, bot: Bot) -> None:
+    if await handle_admin_input(message, bot):
+        return
+    await message.answer(
+        "Используйте кнопки под сообщением. Для возврата в начало отправьте /start."
     )
 
 
@@ -580,6 +775,287 @@ async def process_subscription_update(message: Message) -> None:
         await message.answer(
             "<b>✅ Автопродление PREMIUM снова включено</b>"
         )
+
+
+@router.callback_query(F.data == "admin:home")
+async def callback_admin_home(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    await show_admin_panel(callback.message)
+
+
+@router.callback_query(F.data == "admin:cancel")
+async def callback_admin_cancel(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback, "Действие отменено")
+    ADMIN_FLOW.pop(callback.from_user.id, None)
+    await show_admin_panel(callback.message)
+
+
+@router.callback_query(F.data == "admin:stats")
+async def callback_admin_stats(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    ADMIN_FLOW.pop(callback.from_user.id, None)
+    stats = await DB.get_admin_statistics()
+    await safe_edit(
+        callback.message,
+        texts.admin_statistics_text(stats),
+        kb.admin_back_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def callback_admin_broadcast(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    WAITING_FOR_STICKER_ID.discard(callback.from_user.id)
+    ADMIN_FLOW[callback.from_user.id] = {"state": "broadcast_waiting"}
+    await safe_edit(
+        callback.message,
+        texts.ADMIN_BROADCAST_PROMPT,
+        kb.admin_cancel_input_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:broadcast:send")
+async def callback_admin_broadcast_send(callback: CallbackQuery, bot: Bot) -> None:
+    if not await require_admin_callback(callback):
+        return
+    admin_id = callback.from_user.id
+    flow = ADMIN_FLOW.get(admin_id, {})
+    if flow.get("state") != "broadcast_preview":
+        await answer_callback(callback, "Предпросмотр устарел", show_alert=True)
+        return
+
+    source_chat_id = int(flow.get("source_chat_id", 0) or 0)
+    source_message_id = int(flow.get("source_message_id", 0) or 0)
+    if source_chat_id <= 0 or source_message_id <= 0:
+        await answer_callback(callback, "Не найдено сообщение для рассылки", show_alert=True)
+        return
+
+    ADMIN_FLOW[admin_id] = {"state": "broadcast_sending"}
+    await answer_callback(callback, "Рассылка запущена")
+    user_ids = await DB.get_broadcast_user_ids()
+    total = len(user_ids)
+    delivered = 0
+    blocked = 0
+    failed = 0
+
+    await safe_edit(
+        callback.message,
+        "<b>📢 Рассылка выполняется</b>\n\n"
+        f"Получателей: <b>{total}</b>\n"
+        "Пожалуйста, не запускайте вторую рассылку до завершения этой.",
+    )
+
+    for index, user_id in enumerate(user_ids, start=1):
+        try:
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+            )
+            delivered += 1
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(float(error.retry_after) + 0.2)
+            try:
+                await bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=source_chat_id,
+                    message_id=source_message_id,
+                )
+                delivered += 1
+            except TelegramForbiddenError:
+                blocked += 1
+                await DB.mark_user_inactive(user_id)
+            except Exception:
+                failed += 1
+        except TelegramForbiddenError:
+            blocked += 1
+            await DB.mark_user_inactive(user_id)
+        except TelegramBadRequest as error:
+            error_text = str(error).lower()
+            if "chat not found" in error_text or "bot was blocked" in error_text:
+                blocked += 1
+                await DB.mark_user_inactive(user_id)
+            else:
+                failed += 1
+                logger.warning("Ошибка рассылки пользователю %s: %s", user_id, error)
+        except Exception as error:
+            failed += 1
+            logger.exception("Неожиданная ошибка рассылки пользователю %s: %s", user_id, error)
+
+        if index % 20 == 0:
+            await asyncio.sleep(1.0)
+        else:
+            await asyncio.sleep(0.04)
+
+    await DB.record_broadcast(
+        admin_id=admin_id,
+        source_chat_id=source_chat_id,
+        source_message_id=source_message_id,
+        total=total,
+        delivered=delivered,
+        blocked=blocked,
+        failed=failed,
+    )
+    ADMIN_FLOW.pop(admin_id, None)
+    await safe_edit(
+        callback.message,
+        texts.admin_broadcast_result_text(total, delivered, blocked, failed),
+        kb.admin_back_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:grant")
+async def callback_admin_grant(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    ADMIN_FLOW[callback.from_user.id] = {"state": "grant_waiting_user"}
+    await safe_edit(
+        callback.message,
+        texts.ADMIN_GRANT_PROMPT,
+        kb.admin_cancel_input_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:revoke")
+async def callback_admin_revoke(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    ADMIN_FLOW[callback.from_user.id] = {"state": "revoke_waiting_user"}
+    await safe_edit(
+        callback.message,
+        texts.ADMIN_REVOKE_PROMPT,
+        kb.admin_cancel_input_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "admin:find")
+async def callback_admin_find(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    ADMIN_FLOW[callback.from_user.id] = {"state": "find_waiting_user"}
+    await safe_edit(
+        callback.message,
+        texts.ADMIN_FIND_PROMPT,
+        kb.admin_cancel_input_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:grantuser:"))
+async def callback_admin_grant_user(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    user_id = parse_positive_user_id(callback.data.rsplit(":", 1)[1])
+    if user_id is None or await DB.get_user(user_id) is None:
+        await answer_callback(callback, "Пользователь не найден", show_alert=True)
+        return
+    ADMIN_FLOW[callback.from_user.id] = {"state": "grant_period", "user_id": user_id}
+    await safe_edit(
+        callback.message,
+        "<b>💎 Выберите срок PREMIUM</b>\n\n"
+        f"Пользователь: <code>{user_id}</code>\n\n"
+        "Выбранный срок прибавится к уже действующему доступу.",
+        kb.admin_grant_period_keyboard(user_id),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:grantdays:"))
+async def callback_admin_grant_days(callback: CallbackQuery, bot: Bot) -> None:
+    if not await require_admin_callback(callback):
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await answer_callback(callback, "Неверные данные кнопки", show_alert=True)
+        return
+    user_id = parse_positive_user_id(parts[2])
+    try:
+        days = int(parts[3])
+    except ValueError:
+        days = 0
+    if user_id is None or days not in {30, 90, 180, 365, 36500}:
+        await answer_callback(callback, "Неверный срок PREMIUM", show_alert=True)
+        return
+
+    result = await DB.grant_premium(
+        user_id=user_id,
+        days=days,
+        granted_by=callback.from_user.id,
+    )
+    ADMIN_FLOW.pop(callback.from_user.id, None)
+    await answer_callback(callback, "PREMIUM выдан")
+    await safe_edit(
+        callback.message,
+        texts.admin_grant_result_text(user_id, days, result["expires_at"]),
+        kb.admin_back_keyboard(),
+    )
+
+    if user_id != callback.from_user.id:
+        with suppress(TelegramBadRequest, TelegramForbiddenError):
+            await bot.send_message(
+                user_id,
+                "<b>🎁 Вам выдан MaksiShpi PREMIUM</b>\n\n"
+                f"Доступ: <b>{texts.format_premium_date(result['expires_at'])}</b>\n\n"
+                "Откройте /premium или начните новую игру.",
+            )
+
+
+@router.callback_query(F.data.startswith("admin:revokeuser:"))
+async def callback_admin_revoke_user(callback: CallbackQuery) -> None:
+    if not await require_admin_callback(callback):
+        return
+    await answer_callback(callback)
+    user_id = parse_positive_user_id(callback.data.rsplit(":", 1)[1])
+    if user_id is None:
+        return
+    status = await DB.get_premium_status(user_id)
+    if not status["active"]:
+        await answer_callback(callback, "PREMIUM уже не активен", show_alert=True)
+        return
+    ADMIN_FLOW[callback.from_user.id] = {"state": "revoke_confirm", "user_id": user_id}
+    await safe_edit(
+        callback.message,
+        texts.admin_revoke_confirm_text(user_id, int(status["expires_at"])),
+        kb.admin_revoke_confirm_keyboard(user_id),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:revokeconfirm:"))
+async def callback_admin_revoke_confirm(callback: CallbackQuery, bot: Bot) -> None:
+    if not await require_admin_callback(callback):
+        return
+    user_id = parse_positive_user_id(callback.data.rsplit(":", 1)[1])
+    if user_id is None:
+        await answer_callback(callback, "Неверный Telegram ID", show_alert=True)
+        return
+    await DB.revoke_premium(user_id=user_id, revoked_by=callback.from_user.id)
+    ADMIN_FLOW.pop(callback.from_user.id, None)
+    await answer_callback(callback, "PREMIUM отключён")
+    await safe_edit(
+        callback.message,
+        "<b>🛑 PREMIUM отключён</b>\n\n"
+        f"Пользователь: <code>{user_id}</code>\n\n"
+        "Ручной доступ закрыт. Если у пользователя была платная подписка, "
+        "автопродление нужно отдельно отменить в Telegram.",
+        kb.admin_back_keyboard(),
+    )
+    if user_id != callback.from_user.id:
+        with suppress(TelegramBadRequest, TelegramForbiddenError):
+            await bot.send_message(
+                user_id,
+                "<b>ℹ️ PREMIUM-доступ отключён администратором</b>\n\n"
+                "По вопросам доступа используйте /paysupport.",
+            )
 
 
 @router.callback_query(F.data == "noop")
@@ -956,7 +1432,9 @@ async def callback_default_name(callback: CallbackQuery) -> None:
 
 
 @router.message(F.text)
-async def receive_text(message: Message) -> None:
+async def receive_text(message: Message, bot: Bot) -> None:
+    if await handle_admin_input(message, bot):
+        return
     if message.text.startswith("/"):
         return
     async with CHAT_LOCKS[message.chat.id]:
@@ -1303,18 +1781,29 @@ async def callback_next_round(callback: CallbackQuery) -> None:
 
 
 async def set_commands(bot: Bot) -> None:
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Главное меню"),
-            BotCommand(command="premium", description="Подписка PREMIUM"),
-            BotCommand(command="myid", description="Показать мой Telegram ID"),
-            BotCommand(command="help", description="Правила игры"),
-            BotCommand(command="terms", description="Условия подписки"),
-            BotCommand(command="paysupport", description="Поддержка по оплате"),
-            BotCommand(command="cancel", description="Отменить текущий экран"),
-            BotCommand(command="stickerid", description="Узнать ID стикера"),
-        ]
-    )
+    public_commands = [
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="premium", description="Подписка PREMIUM"),
+        BotCommand(command="myid", description="Показать мой Telegram ID"),
+        BotCommand(command="help", description="Правила игры"),
+        BotCommand(command="terms", description="Условия подписки"),
+        BotCommand(command="paysupport", description="Поддержка по оплате"),
+        BotCommand(command="cancel", description="Отменить текущее действие"),
+    ]
+    await bot.set_my_commands(public_commands)
+
+    admin_commands = public_commands + [
+        BotCommand(command="admin", description="Открыть админ-панель"),
+        BotCommand(command="grantpremium", description="Выдать PREMIUM вручную"),
+        BotCommand(command="revokepremium", description="Забрать PREMIUM вручную"),
+        BotCommand(command="stickerid", description="Узнать ID стикера"),
+    ]
+    for admin_id in CONFIG.admin_ids:
+        with suppress(TelegramBadRequest, TelegramForbiddenError):
+            await bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
 
 
 def configure_logging(level: str) -> None:
@@ -1345,10 +1834,11 @@ async def main() -> None:
     configure_logging(CONFIG.log_level)
     if not CONFIG.admin_ids:
         logger.warning(
-            "ADMIN_IDS не задан. Команды /grantpremium и /revokepremium недоступны."
+            "ADMIN_IDS не задан. Админ-панель и команды управления PREMIUM недоступны."
         )
     DB = Database(CONFIG.database_path)
     await DB.connect()
+    await DB.migrate_session_users()
 
     bot = Bot(
         token=CONFIG.bot_token,
