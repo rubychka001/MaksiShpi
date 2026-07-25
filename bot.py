@@ -73,6 +73,18 @@ async def save_session(chat_id: int, session: dict[str, Any]) -> None:
     await DB.save_session(chat_id, session)
 
 
+def is_admin(user_id: int | None) -> bool:
+    return isinstance(user_id, int) and user_id in CONFIG.admin_ids
+
+
+async def deny_non_admin(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
+    if is_admin(user_id):
+        return False
+    await message.answer("⛔ Эта команда доступна только владельцу бота.")
+    return True
+
+
 async def answer_callback(
     callback: CallbackQuery, text: str | None = None, *, show_alert: bool = False
 ) -> None:
@@ -317,6 +329,107 @@ async def command_start(message: Message, bot: Bot) -> None:
 @router.message(Command("help"))
 async def command_help(message: Message) -> None:
     await message.answer(texts.RULES, reply_markup=kb.back_home_keyboard())
+
+
+@router.message(Command("myid"))
+async def command_my_id(message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    await message.answer(
+        "<b>🆔 Ваш Telegram ID</b>\n\n"
+        f"<code>{user_id}</code>\n\n"
+        "Передайте этот номер владельцу бота, если он должен выдать вам PREMIUM вручную."
+    )
+
+
+@router.message(Command("grantpremium"))
+async def command_grant_premium(message: Message, bot: Bot) -> None:
+    if await deny_non_admin(message):
+        return
+
+    admin_id = message.from_user.id
+    parts = (message.text or "").split()
+    target_user_id = admin_id
+    days = 30
+
+    try:
+        if len(parts) >= 2:
+            target_user_id = int(parts[1])
+        if len(parts) >= 3:
+            days = int(parts[2])
+    except ValueError:
+        await message.answer(
+            "<b>Неверный формат</b>\n\n"
+            "<code>/grantpremium USER_ID ДНИ</code>\n\n"
+            "Например: <code>/grantpremium 123456789 30</code>"
+        )
+        return
+
+    if target_user_id <= 0 or not 1 <= days <= 3650:
+        await message.answer("USER_ID должен быть положительным, а срок — от 1 до 3650 дней.")
+        return
+
+    result = await DB.grant_premium(
+        user_id=target_user_id,
+        days=days,
+        granted_by=admin_id,
+    )
+    expires_at = result["expires_at"]
+    await message.answer(
+        "<b>✅ PREMIUM выдан вручную</b>\n\n"
+        f"Пользователь: <code>{target_user_id}</code>\n"
+        f"Добавлено дней: <b>{days}</b>\n"
+        f"Доступ до: <b>{texts.format_premium_date(expires_at)}</b>\n\n"
+        "Telegram Stars не списывались."
+    )
+
+    if target_user_id != admin_id:
+        with suppress(TelegramBadRequest, TelegramForbiddenError):
+            await bot.send_message(
+                target_user_id,
+                "<b>🎁 Вам выдан MaksiShpi 𝗣𝗥𝗘𝗠𝗜𝗨𝗠</b>\n\n"
+                f"Доступ открыт до <b>{texts.format_premium_date(expires_at)}</b>.\n"
+                "Откройте /premium или начните новую игру.",
+            )
+
+
+@router.message(Command("revokepremium"))
+async def command_revoke_premium(message: Message, bot: Bot) -> None:
+    if await deny_non_admin(message):
+        return
+
+    admin_id = message.from_user.id
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer(
+            "<b>Укажите Telegram ID</b>\n\n"
+            "<code>/revokepremium USER_ID</code>\n\n"
+            "Например: <code>/revokepremium 123456789</code>"
+        )
+        return
+
+    try:
+        target_user_id = int(parts[1])
+    except ValueError:
+        await message.answer("Telegram ID должен состоять только из цифр.")
+        return
+
+    if target_user_id <= 0:
+        await message.answer("Telegram ID должен быть положительным.")
+        return
+
+    await DB.revoke_premium(user_id=target_user_id, revoked_by=admin_id)
+    await message.answer(
+        "<b>🛑 PREMIUM отключён</b>\n\n"
+        f"Пользователь: <code>{target_user_id}</code>"
+    )
+
+    if target_user_id != admin_id:
+        with suppress(TelegramBadRequest, TelegramForbiddenError):
+            await bot.send_message(
+                target_user_id,
+                "<b>ℹ️ PREMIUM-доступ отключён владельцем бота</b>\n\n"
+                "По вопросам доступа используйте /paysupport.",
+            )
 
 
 @router.message(Command("premium"))
@@ -1194,6 +1307,7 @@ async def set_commands(bot: Bot) -> None:
         [
             BotCommand(command="start", description="Главное меню"),
             BotCommand(command="premium", description="Подписка PREMIUM"),
+            BotCommand(command="myid", description="Показать мой Telegram ID"),
             BotCommand(command="help", description="Правила игры"),
             BotCommand(command="terms", description="Условия подписки"),
             BotCommand(command="paysupport", description="Поддержка по оплате"),
@@ -1229,6 +1343,10 @@ async def main() -> None:
     global DB, CONFIG
     CONFIG = load_config()
     configure_logging(CONFIG.log_level)
+    if not CONFIG.admin_ids:
+        logger.warning(
+            "ADMIN_IDS не задан. Команды /grantpremium и /revokepremium недоступны."
+        )
     DB = Database(CONFIG.database_path)
     await DB.connect()
 

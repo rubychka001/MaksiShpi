@@ -61,6 +61,20 @@ class Database:
         )
         await self.connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS premium_manual_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                granted_by INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                days INTEGER NOT NULL DEFAULT 0,
+                previous_expires_at INTEGER NOT NULL DEFAULT 0,
+                new_expires_at INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await self.connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
@@ -247,6 +261,99 @@ class Database:
             (telegram_payment_charge_id,),
         )
         await connection.commit()
+
+    async def grant_premium(
+        self,
+        *,
+        user_id: int,
+        days: int,
+        granted_by: int,
+        now_ts: int | None = None,
+    ) -> dict[str, int]:
+        """Вручную добавляет дни PREMIUM без списания Telegram Stars."""
+        if user_id <= 0:
+            raise ValueError("user_id должен быть положительным")
+        if not 1 <= days <= 3650:
+            raise ValueError("days должен быть от 1 до 3650")
+
+        connection = self._require_connection()
+        current_time = int(now_ts if now_ts is not None else time.time())
+        status = await self.get_premium_status(user_id, current_time)
+        previous_expires_at = int(status["expires_at"])
+        base_expires_at = max(current_time, previous_expires_at)
+        new_expires_at = base_expires_at + days * 24 * 60 * 60
+
+        await connection.execute(
+            """
+            INSERT INTO premium_subscriptions (
+                user_id, expires_at, telegram_payment_charge_id,
+                provider_payment_charge_id, last_amount, currency, updated_at
+            )
+            VALUES (?, ?, '', '', 0, 'MANUAL', CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, new_expires_at),
+        )
+        await connection.execute(
+            """
+            INSERT INTO premium_manual_grants (
+                user_id, granted_by, action, days,
+                previous_expires_at, new_expires_at
+            )
+            VALUES (?, ?, 'grant', ?, ?, ?)
+            """,
+            (user_id, granted_by, days, previous_expires_at, new_expires_at),
+        )
+        await connection.commit()
+        return {
+            "previous_expires_at": previous_expires_at,
+            "expires_at": new_expires_at,
+        }
+
+    async def revoke_premium(
+        self,
+        *,
+        user_id: int,
+        revoked_by: int,
+    ) -> dict[str, int]:
+        """Вручную отключает локальный PREMIUM-доступ пользователя."""
+        if user_id <= 0:
+            raise ValueError("user_id должен быть положительным")
+
+        connection = self._require_connection()
+        status = await self.get_premium_status(user_id)
+        previous_expires_at = int(status["expires_at"])
+
+        await connection.execute(
+            """
+            INSERT INTO premium_subscriptions (
+                user_id, expires_at, telegram_payment_charge_id,
+                provider_payment_charge_id, last_amount, currency, updated_at
+            )
+            VALUES (?, 0, '', '', 0, 'MANUAL', CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                expires_at = 0,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id,),
+        )
+        await connection.execute(
+            """
+            INSERT INTO premium_manual_grants (
+                user_id, granted_by, action, days,
+                previous_expires_at, new_expires_at
+            )
+            VALUES (?, ?, 'revoke', 0, ?, 0)
+            """,
+            (user_id, revoked_by, previous_expires_at),
+        )
+        await connection.commit()
+        return {
+            "previous_expires_at": previous_expires_at,
+            "expires_at": 0,
+        }
 
     async def get_setting(self, key: str) -> str | None:
         connection = self._require_connection()
